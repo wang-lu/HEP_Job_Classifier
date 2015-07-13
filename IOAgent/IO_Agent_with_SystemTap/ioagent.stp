@@ -1,0 +1,197 @@
+#/usr/bin/stap
+#
+# Writen by Lu Wang(Lu.Wang@ihep.ac.cn)
+
+# Trace I/O pattern for HEP jobs
+#
+#
+# Usage: stap client.stp -F -o /youroutput -x yourpid&
+
+global myfd,r_time,w_time,myrseek,mywseek,count,myread,mywrite,myfpos,starttime,rwsig
+
+function filterfs(myfile:long){
+	fstypep=@cast(myfile,"file","kernel")->f_dentry->d_inode->i_sb->s_type->name
+	if (kernel_string(fstypep)=="lustre" || kernel_string(fstypep)=="fuse"){
+		return 1
+	}else{
+		return 0
+	}
+}
+function printsm(){
+		 rn=@count(myread)
+		 wn=@count(mywrite)
+		 srn=@count(myrseek)
+		 swn=@count(mywseek)
+		 ut=gettimeofday_s()-starttime;
+		 total=rn+wn+srn+swn
+		 printf("Total Count:%d\n",total)
+                 printf("Read Size:\n")
+                 if(rn>0){
+                         print(@hist_log(myread))
+                 }
+                 if(@sum(r_time)>0){
+                         myrate=@sum(myread)*1024/@sum(r_time)
+		 }else{
+			 myrate=0
+		 }
+		if (ut>0){
+			myrate2=@sum(myread)/ut/1024
+		}else{
+			myrate2=0
+		}
+		 		
+                printf("Read Throughput: %d KB/s, %d KB/s\n",myrate,myrate2)
+                printf("Write Size:\n")
+                if(wn>0){
+                         print(@hist_log(mywrite))
+                }
+                if(@sum(w_time)>0){
+                         myrate=@sum(mywrite)*1024/@sum(w_time)
+                 }else{
+			myrate=0
+		 }
+		if (ut>0){
+			myrate2=@sum(mywrite)/ut/1024
+		}else{
+			myrate2=0
+		}
+                printf("Write Throughput: %d KB/s,%d KB/s\n",myrate,myrate2)
+
+                printf("Read Seek Size:\n")
+                if(srn>0){
+                         print(@hist_log(myrseek))
+                 }
+		printf("Read Seek End\n");
+                printf("Write Seek Size:\n")
+                if(swn>0){
+                         print(@hist_log(mywseek))
+                 }
+		printf("Write Seek End\n");
+		if(total==0){
+			printf("Read Ratio:%d\nWrite Ratio:%d\nRead Seek Ratio:%d\nWrite Seek Ratio:%d\n",0,0,0,0)
+		}else{
+			printf("Read Ratio:%d\nWrite Ratio:%d\nRead Seek Ratio:%d\nWrite Seek Ratio:%d\n",rn*100/total,wn*100/total,srn*100/total,swn*100/total);
+		}
+}
+
+probe syscall.lseek.return{
+	if((target()==pid()) && ($return != -1)){
+		myfile=@cast(task_current(), "task_struct")->files->fdt->fd[$fd]
+		if((myfile!=0)&&filterfs(myfile)){
+			sn=$return-myfpos[$fd]
+			if (sn!=0){
+				count++
+				if (rwsig[$fd]==2){
+					mywseek <<< $return-myfpos[$fd]
+				}else{
+					myrseek <<< $return-myfpos[$fd]
+				}
+				myfpos[$fd]=$return
+			}
+			if (count>9000){
+				print("max record size hit\n")
+				printsm()
+				exit()
+			}
+		}
+	}
+}
+
+probe syscall.open.return{
+	if((target()==pid()) && ($return != -1)){
+		myfile = @cast(task_current(), "task_struct")->files->fdt->fd[$return]		
+		if ((myfile!=0) && filterfs(myfile) ){
+			count++
+			myfpos[$return]=0
+			if (count>9000){
+				print("max record size hit\n")
+				printsm()
+				exit()
+			}
+			myfn=kernel_string($filename)
+			myfd[$return] = myfn
+		}
+	}
+}
+
+probe syscall.read.return{
+	if((target()==pid()) && ($return != -1)){
+		myfile = @cast(task_current(), "task_struct")->files->fdt->fd[$fd];
+		if ( (myfile !=0) && filterfs(myfile)){
+			if (!( [$fd] in myfd )){
+				myfd[$fd]=__file_filename(myfile)
+			}
+			mypos=@cast(myfile, "file", "kernel")->f_pos
+			myfpos[$fd]=mypos
+			ct=@entry(gettimeofday_us())
+			mytime=gettimeofday_us()
+			myspan=mytime-ct
+			count++
+			if (count>9000){
+				print("max record size hit\n")
+				printsm()
+				exit()
+			}
+			r_time <<< myspan
+			myread <<< $return
+			rwsig[$fd]=1
+		}
+	}
+}
+probe syscall.write.return{
+	if((target()==pid()) && ($return != -1)){
+		myfile = @cast(task_current(), "task_struct")->files->fdt->fd[$fd]
+		if ((myfile !=0) && filterfs(myfile)){	
+			if (!( [$fd] in myfd )){
+				myfd[$fd]=__file_filename(myfile)
+			}
+			mypos=@cast(myfile, "file", "kernel")->f_pos
+			myfpos[$fd]=mypos
+			ct=@entry(gettimeofday_us())
+			mytime=gettimeofday_us()
+			myspan=mytime-ct
+			count++
+			if (count>9000){
+				print("max record size hit\n")
+				printsm()
+				exit()
+			}
+			w_time <<< myspan
+			mywrite <<< $return
+			rwsig[$fd]=2
+		}
+	}
+}
+
+probe syscall.close.return{
+	if((target()==pid()) && ($return != -1)){
+		if ($fd in myfd){
+			count++
+			if (count>9000){
+				print("max record size hit\n")
+				printsm()
+				exit()
+			}
+	    	}
+	}
+}
+
+probe timer.s(60){
+	printsm()
+	exit()
+}
+probe process.end{
+	 if(target()==pid()) {
+		printf ("process %ld ends by itself during the probe at %ld\n",target(),gettimeofday_s())
+		printsm()
+		exit()
+	 }
+}
+probe begin{
+	starttime=gettimeofday_s()
+	printf("probe of process %ld start at %ld\n", target(),gettimeofday_s())	
+}
+
+probe end{
+	printf("probe of process %ld end at %ld\n", target(),gettimeofday_s())
+}
